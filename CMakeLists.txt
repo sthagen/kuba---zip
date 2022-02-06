@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.4)
 
 project(zip
   LANGUAGES C
-  VERSION "0.2.0")
+  VERSION "0.2.2")
 set(CMAKE_MODULE_PATH "${PROJECT_SOURCE_DIR}/cmake" ${CMAKE_MODULE_PATH})
 set(CMAKE_VERBOSE_MAKEFILE ON)
 
@@ -13,6 +13,11 @@ option(ZIP_BUILD_DOCS "Generate API documentation with Doxygen" OFF)
 
 if(ZIP_ENABLE_SHARABLE_FILE_OPEN)
 	add_definitions(-DZIP_ENABLE_SHARABLE_FILE_OPEN)
+endif()
+
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+	# large file support
+	add_definitions(-D_LARGEFILE_SOURCE -D_FILE_OFFSET_BITS=64)
 endif()
 
 # zip
@@ -62,8 +67,6 @@ elseif ("${CMAKE_C_COMPILER_ID}" STREQUAL "GNU" OR
 endif (MSVC)
 
 ####
-# Installation (https://github.com/forexample/package-example) {
-
 set(CONFIG_INSTALL_DIR "lib/cmake/${PROJECT_NAME}")
 set(INCLUDE_INSTALL_DIR "include")
 
@@ -102,8 +105,6 @@ install(
     NAMESPACE "${NAMESPACE}"
     DESTINATION "${CONFIG_INSTALL_DIR}"
 )
-
-# }
 
 install(TARGETS ${PROJECT_NAME}
         EXPORT ${TARGETS_EXPORT_NAME}
