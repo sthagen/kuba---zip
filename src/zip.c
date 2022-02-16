@@ -258,8 +258,14 @@ static char *zip_name_normalize(char *name, char *const nname, size_t len) {
 }
 
 static mz_bool zip_name_match(const char *name1, const char *name2) {
-  size_t len2 = strlen(name2);
-  char *nname2 = zip_strrpl(name2, len2, '\\', '/');
+  char *nname2 = NULL;
+
+#ifdef ZIP_RAW_ENTRYNAME
+  nname2 = STRCLONE(name2);
+#else
+  nname2 = zip_strrpl(name2, strlen(name2), '\\', '/');
+#endif
+
   if (!nname2) {
     return MZ_FALSE;
   }
@@ -919,7 +925,12 @@ int zip_entry_open(struct zip_t *zip, const char *entryname) {
   if (zip->entry.name) {
     CLEANUP(zip->entry.name);
   }
+#ifdef ZIP_RAW_ENTRYNAME
+  zip->entry.name = STRCLONE(entryname);
+#else
   zip->entry.name = zip_strrpl(entryname, entrylen, '\\', '/');
+#endif
+
   if (!zip->entry.name) {
     // Cannot parse zip entry name
     return ZIP_EINVENTNAME;
@@ -995,7 +1006,9 @@ int zip_entry_open(struct zip_t *zip, const char *entryname) {
   local_dir_header_ofs += num_alignment_padding_bytes;
 
   zip->entry.m_time = time(NULL);
+#ifndef MINIZ_NO_TIME
   mz_zip_time_t_to_dos_time(zip->entry.m_time, &dos_time, &dos_date);
+#endif
 
   // ZIP64 header with NULL sizes (sizes will be in the data descriptor, just
   // after file data)
@@ -1118,7 +1131,12 @@ int zip_entry_openbyindex(struct zip_t *zip, int index) {
   if (zip->entry.name) {
     CLEANUP(zip->entry.name);
   }
+#ifdef ZIP_RAW_ENTRYNAME
+  zip->entry.name = STRCLONE(pFilename);
+#else
   zip->entry.name = zip_strrpl(pFilename, namelen, '\\', '/');
+#endif
+
   if (!zip->entry.name) {
     // local entry name is NULL
     return ZIP_EINVENTNAME;
@@ -1153,6 +1171,8 @@ int zip_entry_close(struct zip_t *zip) {
   mz_uint8 *pExtra_data = NULL;
   mz_uint32 extra_size = 0;
   mz_uint8 extra_data[MZ_ZIP64_MAX_CENTRAL_EXTRA_FIELD_SIZE];
+  mz_uint8 local_dir_footer[MZ_ZIP_DATA_DESCRIPTER_SIZE64];
+  mz_uint32 local_dir_footer_size = MZ_ZIP_DATA_DESCRIPTER_SIZE32;
 
   if (!zip) {
     // zip_t handler is not initialized
@@ -1182,9 +1202,6 @@ int zip_entry_close(struct zip_t *zip) {
 #ifndef MINIZ_NO_TIME
   mz_zip_time_t_to_dos_time(zip->entry.m_time, &dos_time, &dos_date);
 #endif
-
-  mz_uint8 local_dir_footer[MZ_ZIP_DATA_DESCRIPTER_SIZE64];
-  mz_uint32 local_dir_footer_size = MZ_ZIP_DATA_DESCRIPTER_SIZE32;
 
   MZ_WRITE_LE32(local_dir_footer + 0, MZ_ZIP_DATA_DESCRIPTOR_ID);
   MZ_WRITE_LE32(local_dir_footer + 4, zip->entry.uncomp_crc32);
