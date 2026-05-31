@@ -223,6 +223,7 @@ struct zip_entry_t {
   mz_uint8 header[MZ_ZIP_LOCAL_DIR_HEADER_SIZE];
   mz_uint64 header_offset;
   mz_uint16 method;
+  mz_uint16 version_made_by;
 #if ZIP_ENABLE_DEFLATE
   mz_zip_writer_add_state state;
   tdefl_compressor comp;
@@ -377,6 +378,7 @@ static int zip_mkpath(char *path, size_t pos) {
 
   memset(npath, 0, MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE + 1);
   strncpy(npath, path, len);
+  npath[MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE] = '\0';
 
   if (MZ_FILE_STAT(npath, &st) < 0) {
     return ZIP_ENOFILE;
@@ -528,6 +530,17 @@ static int zip_archive_truncate(mz_zip_archive *pzip) {
 }
 #endif /* ZIP_ENABLE_DEFLATE */
 
+static mz_bool zip_stat_is_symlink(mz_uint16 version_made_by,
+                                   mz_uint32 external_attr) {
+  // if zip is produced on Unix or macOS (3 and 19 from
+  // section 4.4.2.2 of zip standard)
+  mz_bool is_unix_or_macos =
+      ((version_made_by >> 8) == 3) || ((version_made_by >> 8) == 19);
+
+  // and has sym link attribute (0x80 is file, 0x40 is directory)
+  return is_unix_or_macos && (external_attr & (0x20 << 24));
+}
+
 #if ZIP_ENABLE_INFLATE
 #ifndef MINIZ_NO_STDIO
 
@@ -542,7 +555,7 @@ static int zip_archive_extract(mz_zip_archive *zip_archive, const char *dir,
   char symlink_to[MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE + 1];
 #endif
   mz_zip_archive_file_stat info;
-  size_t dirlen = 0, filename_size = MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE;
+  size_t dirlen = 0, filename_size;
   mz_uint32 xattr = 0;
 
   memset(path, 0, sizeof(path));
@@ -572,9 +585,7 @@ static int zip_archive_extract(mz_zip_archive *zip_archive, const char *dir,
     ++dirlen;
   }
 
-  if (filename_size > MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE - dirlen) {
-    filename_size = MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE - dirlen;
-  }
+  filename_size = sizeof(path) / sizeof(char) - dirlen;
   // Get and print information about each file in the archive.
   n = mz_zip_reader_get_num_files(zip_archive);
   for (i = 0; i < n; ++i) {
@@ -596,6 +607,7 @@ static int zip_archive_extract(mz_zip_archive *zip_archive, const char *dir,
 #else
     strncpy(&path[dirlen], info.m_filename, filename_size);
 #endif
+    path[sizeof(path) / sizeof(char) - 1] = '\0';
 
     err = zip_mkpath(path, dirlen);
     if (err < 0) {
@@ -603,13 +615,7 @@ static int zip_archive_extract(mz_zip_archive *zip_archive, const char *dir,
       goto out;
     }
 
-    if ((((info.m_version_made_by >> 8) == 3) ||
-         ((info.m_version_made_by >> 8) ==
-          19)) // if zip is produced on Unix or macOS (3 and 19 from
-               // section 4.4.2.2 of zip standard)
-        && info.m_external_attr &
-               (0x20 << 24)) { // and has sym link attribute (0x80 is file,
-                               // 0x40 is directory)
+    if (zip_stat_is_symlink(info.m_version_made_by, info.m_external_attr)) {
 #if ZIP_HAVE_SYMLINK
       if (info.m_uncomp_size > MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE ||
           !mz_zip_reader_extract_to_mem_no_alloc(
@@ -1510,6 +1516,7 @@ static int _zip_entry_open(struct zip_t *zip, const char *entryname,
     zip->entry.dir_offset = stats.m_central_dir_ofs;
     zip->entry.header_offset = stats.m_local_header_ofs;
     zip->entry.method = stats.m_method;
+    zip->entry.version_made_by = stats.m_version_made_by;
     zip->entry.external_attr = stats.m_external_attr;
 #ifndef MINIZ_NO_TIME
     zip->entry.m_time = stats.m_time;
@@ -1548,6 +1555,7 @@ static int _zip_entry_open(struct zip_t *zip, const char *entryname,
   zip->entry.header_offset = zip->archive.m_archive_size;
   memset(zip->entry.header, 0, MZ_ZIP_LOCAL_DIR_HEADER_SIZE * sizeof(mz_uint8));
   zip->entry.method = level ? MZ_DEFLATED : 0;
+  zip->entry.version_made_by = 0;
 
   // UNIX or APPLE
 #if MZ_PLATFORM == 3 || MZ_PLATFORM == 19
@@ -1764,6 +1772,7 @@ int zip_entry_openbyindex(struct zip_t *zip, size_t index) {
   zip->entry.dir_offset = stats.m_central_dir_ofs;
   zip->entry.header_offset = stats.m_local_header_ofs;
   zip->entry.method = stats.m_method;
+  zip->entry.version_made_by = stats.m_version_made_by;
   zip->entry.external_attr = stats.m_external_attr;
 #ifndef MINIZ_NO_TIME
   zip->entry.m_time = stats.m_time;
@@ -2032,6 +2041,21 @@ int zip_entry_isdir(struct zip_t *zip) {
     return 0;
   }
   return ISSLASH(zip->entry.name[entrylen - 1]);
+}
+
+int zip_entry_issymlink(struct zip_t *zip) {
+  if (!zip) {
+    // zip_t handler is not initialized
+    return ZIP_ENOINIT;
+  }
+
+  if (zip->entry.index < (ssize_t)0) {
+    // zip entry is not opened
+    return ZIP_EINVIDX;
+  }
+
+  return zip_stat_is_symlink(zip->entry.version_made_by,
+                             zip->entry.external_attr);
 }
 
 unsigned long long zip_entry_size(struct zip_t *zip) {
@@ -2404,6 +2428,10 @@ ssize_t zip_entry_noallocreadwithoffset(struct zip_t *zip, size_t offset,
     ssize_t n = zip_entry_decrypt_and_read(zip, &heap_buf, &heap_size);
     if (n < 0) {
       return n;
+    }
+    if (offset >= heap_size) {
+      free(heap_buf);
+      return (ssize_t)0;
     }
     if (offset + size > heap_size) {
       size = heap_size - offset;
