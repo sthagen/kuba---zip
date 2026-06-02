@@ -544,6 +544,50 @@ static mz_bool zip_stat_is_symlink(mz_uint16 version_made_by,
 #if ZIP_ENABLE_INFLATE
 #ifndef MINIZ_NO_STDIO
 
+#if ZIP_HAVE_SYMLINK
+// Returns MZ_TRUE if a symlink whose (already normalized, archive-relative)
+// name is link_name and whose contents are target would resolve outside the
+// extraction root. Absolute targets always escape; relative targets are walked
+// component by component while tracking depth below the root.
+static mz_bool zip_symlink_target_escapes(const char *link_name,
+                                          const char *target) {
+  long depth = 0;
+  const char *p;
+
+  if (ISSLASH(target[0])) {
+    return MZ_TRUE;
+  }
+
+  // the symlink lives one level deeper for each separator in its name
+  for (p = link_name; *p; ++p) {
+    if (ISSLASH(*p)) {
+      ++depth;
+    }
+  }
+
+  for (p = target; *p;) {
+    const char *seg = p;
+    size_t len = 0;
+    while (*p && !ISSLASH(*p)) {
+      ++p;
+      ++len;
+    }
+    if (len == 2 && seg[0] == '.' && seg[1] == '.') {
+      if (--depth < 0) {
+        return MZ_TRUE;
+      }
+    } else if (!(len == 0 || (len == 1 && seg[0] == '.'))) {
+      ++depth;
+    }
+    while (ISSLASH(*p)) {
+      ++p;
+    }
+  }
+
+  return MZ_FALSE;
+}
+#endif
+
 static int zip_archive_extract(mz_zip_archive *zip_archive, const char *dir,
                                int (*on_extract)(const char *filename,
                                                  void *arg),
@@ -625,6 +669,10 @@ static int zip_archive_extract(mz_zip_archive *zip_archive, const char *dir,
         goto out;
       }
       symlink_to[info.m_uncomp_size] = '\0';
+      if (zip_symlink_target_escapes(info.m_filename, symlink_to)) {
+        err = ZIP_EINVENTNAME;
+        goto out;
+      }
       if (symlink(symlink_to, path) != 0) {
         err = ZIP_ESYMLINK;
         goto out;
@@ -2268,6 +2316,10 @@ static ssize_t zip_entry_decrypt_and_read(struct zip_t *zip, void **buf,
 
   if (stat.m_method == MZ_DEFLATED) {
     size_t uncomp_size = (size_t)stat.m_uncomp_size;
+    if (uncomp_size == SIZE_MAX) {
+      free(enc_data);
+      return (ssize_t)ZIP_EOOMEM;
+    }
     out_buf = malloc(uncomp_size + 1);
     if (!out_buf) {
       free(enc_data);
@@ -2311,6 +2363,10 @@ static ssize_t zip_entry_decrypt_and_read(struct zip_t *zip, void **buf,
     return (ssize_t)uncomp_size;
   } else {
     size_t uncomp_size = (size_t)stat.m_uncomp_size;
+    if (uncomp_size == SIZE_MAX) {
+      free(enc_data);
+      return (ssize_t)ZIP_EOOMEM;
+    }
     out_buf = malloc(uncomp_size + 1);
     if (!out_buf) {
       free(enc_data);
