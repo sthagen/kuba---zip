@@ -65,6 +65,9 @@
 #define ISSLASH(C) ((C) == '/' || (C) == '\\')
 #endif
 
+/* setuid/setgid/sticky bits (S_ISUID | S_ISGID | S_ISVTX) */
+#define ZIP_SETID_MASK 07000
+
 #define CLEANUP(ptr)                                                           \
   do {                                                                         \
     if (ptr) {                                                                 \
@@ -696,6 +699,8 @@ static int zip_archive_extract(mz_zip_archive *zip_archive, const char *dir,
       (void)xattr; // unused
 #else
       xattr = (info.m_external_attr >> 16) & 0xFFFF;
+      // do not restore setuid/setgid/sticky bits from an untrusted archive
+      xattr &= ~(mz_uint32)ZIP_SETID_MASK;
       if (xattr > 0 && xattr <= MZ_UINT16_MAX) {
         if (CHMOD(path, (mode_t)xattr) < 0) {
           err = ZIP_ENOPERM;
@@ -2225,7 +2230,8 @@ int zip_entry_fwrite(struct zip_t *zip, const char *filename) {
     modes |= UNX_IFIFO;
   if (S_ISSOCK(file_stat.st_mode))
     modes |= UNX_IFSOCK;
-  zip->entry.external_attr = (modes << 16) | !(file_stat.st_mode & S_IWUSR);
+  zip->entry.external_attr =
+      ((mz_uint32)modes << 16) | !(file_stat.st_mode & S_IWUSR);
   if ((file_stat.st_mode & S_IFMT) == S_IFDIR) {
     zip->entry.external_attr |= MZ_ZIP_DOS_DIR_ATTRIBUTE_BITFLAG;
   }
@@ -2336,23 +2342,23 @@ static ssize_t zip_entry_decrypt_and_read(struct zip_t *zip, void **buf,
       for (;;) {
         size_t in_avail = dec_size - in_pos;
         size_t out_avail = uncomp_size - out_pos;
-        int flags = TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF;
-        if (in_avail == 0)
-          flags |= TINFL_FLAG_HAS_MORE_INPUT;
 
-        tstatus = tinfl_decompress(
-            &decomp, dec_data + in_pos, &in_avail, (mz_uint8 *)out_buf,
-            (mz_uint8 *)out_buf + out_pos, &out_avail, flags);
+        tstatus = tinfl_decompress(&decomp, dec_data + in_pos, &in_avail,
+                                   (mz_uint8 *)out_buf,
+                                   (mz_uint8 *)out_buf + out_pos, &out_avail,
+                                   TINFL_FLAG_USING_NON_WRAPPING_OUTPUT_BUF);
         in_pos += in_avail;
         out_pos += out_avail;
 
         if (tstatus == TINFL_STATUS_DONE)
           break;
-        if (tstatus < 0) {
-          free(enc_data);
-          free(out_buf);
-          return (ssize_t)ZIP_EPASSWD;
-        }
+        // the whole payload is already in dec_data and the output buffer is
+        // sized to the declared uncomp_size, so a NEEDS_MORE_INPUT or
+        // HAS_MORE_OUTPUT result means the entry is truncated or its declared
+        // size is wrong; bail out instead of spinning on it
+        free(enc_data);
+        free(out_buf);
+        return (ssize_t)ZIP_EPASSWD;
       }
     }
 
@@ -2600,6 +2606,8 @@ int zip_entry_fread(struct zip_t *zip, const char *filename) {
   }
 
   xattr = (info.m_external_attr >> 16) & 0xFFFF;
+  // do not restore setuid/setgid/sticky bits from an untrusted archive
+  xattr &= ~(mz_uint32)ZIP_SETID_MASK;
   if (xattr > 0 && xattr <= MZ_UINT16_MAX) {
     if (CHMOD(filename, (mode_t)xattr) < 0) {
       return ZIP_ENOPERM;
