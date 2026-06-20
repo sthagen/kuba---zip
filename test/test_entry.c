@@ -221,6 +221,30 @@ MU_TEST(test_entry_read) {
   free(bufencode2);
 }
 
+MU_TEST(test_entry_name_too_long) {
+  // the zip filename length field is 16-bit; a name that does not fit must be
+  // rejected instead of being silently truncated into a corrupt entry
+  size_t toolong = (size_t)0xFFFF + 1;
+  char *name = (char *)malloc(toolong + 1);
+  mu_check(name != NULL);
+  memset(name, 'a', toolong);
+  name[toolong] = '\0';
+
+  struct zip_t *zip =
+      zip_stream_open(NULL, 0, ZIP_DEFAULT_COMPRESSION_LEVEL, 'w');
+  mu_check(zip != NULL);
+
+  mu_assert_int_eq(ZIP_EINVENTNAME, zip_entry_open(zip, name));
+
+  // a name of exactly 0xFFFF bytes still fits the field
+  name[0xFFFF] = '\0';
+  mu_assert_int_eq(0, zip_entry_open(zip, name));
+  mu_assert_int_eq(0, zip_entry_close(zip));
+
+  zip_stream_close(zip);
+  free(name);
+}
+
 MU_TEST(test_list_entries) {
   struct zip_t *zip = zip_open(ZIPNAME, 0, 'r');
   mu_check(zip != NULL);
@@ -336,6 +360,30 @@ MU_TEST(test_entries_deleteinvalid) {
   buf = NULL;
 
   zip_close(zip);
+}
+
+MU_TEST(test_entries_delete_emptyarchive) {
+  char emptyname[L_tmpnam + 1] = {0};
+  strncpy(emptyname, "z-XXXXXX\0", L_tmpnam);
+  MKTEMP(emptyname);
+
+  struct zip_t *zip = zip_open(emptyname, ZIP_DEFAULT_COMPRESSION_LEVEL, 'w');
+  mu_check(zip != NULL);
+  zip_close(zip);
+
+  char *names[] = {"whatever"};
+  zip = zip_open(emptyname, 0, 'd');
+  mu_check(zip != NULL);
+  mu_assert_int_eq(0, zip_entries_delete(zip, names, 1));
+  zip_close(zip);
+
+  size_t idx[] = {0};
+  zip = zip_open(emptyname, 0, 'd');
+  mu_check(zip != NULL);
+  mu_assert_int_eq(0, zip_entries_deletebyindex(zip, idx, 1));
+  zip_close(zip);
+
+  UNLINK(emptyname);
 }
 
 MU_TEST(test_entries_delete) {
@@ -700,8 +748,10 @@ MU_TEST_SUITE(test_entry_suite) {
   MU_RUN_TEST(test_entry_index);
   MU_RUN_TEST(test_entry_openbyindex);
   MU_RUN_TEST(test_entry_read);
+  MU_RUN_TEST(test_entry_name_too_long);
   MU_RUN_TEST(test_list_entries);
   MU_RUN_TEST(test_entries_deletebyindex);
+  MU_RUN_TEST(test_entries_delete_emptyarchive);
   MU_RUN_TEST(test_entries_delete);
   MU_RUN_TEST(test_entries_delete_stream);
   MU_RUN_TEST(test_entries_deletebyindex_stream);

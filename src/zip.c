@@ -167,7 +167,7 @@ static void zip_pkware_keys_update(struct zip_pkware_keys_t *keys, mz_uint8 c) {
 
 /* Derives the next keystream byte from the current cipher state. */
 static mz_uint8 zip_pkware_decrypt_byte(const struct zip_pkware_keys_t *keys) {
-  mz_uint16 temp = (mz_uint16)(keys->key2 | 2);
+  mz_uint32 temp = (mz_uint16)(keys->key2 | 2);
   return (mz_uint8)((temp * (temp ^ 1)) >> 8);
 }
 
@@ -891,6 +891,11 @@ static int zip_entry_finalize(struct zip_t *zip,
                               struct zip_entry_mark_t *entry_mark,
                               const size_t n) {
   size_t i = 0;
+  // nothing to finalize for an empty archive; n == 0 would underflow n - 1
+  // below and walk both arrays out of bounds
+  if (n == 0) {
+    return 0;
+  }
   mz_uint64 *local_header_ofs_array = (mz_uint64 *)calloc(n, sizeof(mz_uint64));
   if (!local_header_ofs_array) {
     return ZIP_EOOMEM;
@@ -1535,6 +1540,13 @@ static int _zip_entry_open(struct zip_t *zip, const char *entryname,
 
   entrylen = strlen(entryname);
   if (entrylen == 0) {
+    return ZIP_EINVENTNAME;
+  }
+
+  // the zip filename length is a 16-bit field; a longer name is truncated by
+  // the (mz_uint16) cast in the local/central header while the full name is
+  // still written, leaving a corrupt entry
+  if (entrylen > MZ_UINT16_MAX) {
     return ZIP_EINVENTNAME;
   }
 
@@ -2362,6 +2374,15 @@ static ssize_t zip_entry_decrypt_and_read(struct zip_t *zip, void **buf,
       }
     }
 
+#ifndef MINIZ_DISABLE_ZIP_READER_CRC32_CHECKS
+    if (mz_crc32(MZ_CRC32_INIT, (const mz_uint8 *)out_buf, out_pos) !=
+        stat.m_crc32) {
+      free(enc_data);
+      free(out_buf);
+      return (ssize_t)ZIP_EPASSWD;
+    }
+#endif
+
     free(enc_data);
     *buf = out_buf;
     if (bufsize) {
@@ -2383,6 +2404,14 @@ static ssize_t zip_entry_decrypt_and_read(struct zip_t *zip, void **buf,
       dec_size = uncomp_size;
     }
     memcpy(out_buf, dec_data, dec_size);
+#ifndef MINIZ_DISABLE_ZIP_READER_CRC32_CHECKS
+    if (mz_crc32(MZ_CRC32_INIT, (const mz_uint8 *)out_buf, dec_size) !=
+        stat.m_crc32) {
+      free(enc_data);
+      free(out_buf);
+      return (ssize_t)ZIP_EPASSWD;
+    }
+#endif
     free(enc_data);
     *buf = out_buf;
     if (bufsize) {
