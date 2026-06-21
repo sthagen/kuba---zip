@@ -664,7 +664,13 @@ static int zip_archive_extract(mz_zip_archive *zip_archive, const char *dir,
 
     if (zip_stat_is_symlink(info.m_version_made_by, info.m_external_attr)) {
 #if ZIP_HAVE_SYMLINK
-      if (info.m_uncomp_size > MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE ||
+      // the link target is the entry's file data; an entry that carries none
+      // (directory-flagged or zero comp_size) makes the no-alloc extractor
+      // return success without writing symlink_to, leaving a previous entry's
+      // target behind and creating a link to stale data
+      if (info.m_comp_size == 0 ||
+          mz_zip_reader_is_file_a_directory(zip_archive, i) ||
+          info.m_uncomp_size > MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE ||
           !mz_zip_reader_extract_to_mem_no_alloc(
               zip_archive, i, symlink_to, MZ_ZIP_MAX_ARCHIVE_FILENAME_SIZE, 0,
               NULL, 0)) {
@@ -770,10 +776,17 @@ static ssize_t zip_entry_mark(struct zip_t *zip,
     }
 
     if (!mz_zip_reader_file_stat(&zip->archive, (mz_uint)i, &file_stat)) {
+      zip_entry_close(zip);
       return ZIP_ENOENT;
     }
 
     zip_entry_close(zip);
+
+    // an offset past the archive comes from a corrupt (zip64) central-directory
+    // header; zip_entry_finalize would underflow m_archive_size - ofs on it
+    if (file_stat.m_local_header_ofs > zip->archive.m_archive_size) {
+      return ZIP_ENOHDR;
+    }
 
     entry_mark[i].m_local_header_ofs = file_stat.m_local_header_ofs;
     entry_mark[i].file_index = (ssize_t)-1;
@@ -827,10 +840,17 @@ static ssize_t zip_entry_markbyindex(struct zip_t *zip,
     }
 
     if (!mz_zip_reader_file_stat(&zip->archive, (mz_uint)i, &file_stat)) {
+      zip_entry_close(zip);
       return ZIP_ENOENT;
     }
 
     zip_entry_close(zip);
+
+    // an offset past the archive comes from a corrupt (zip64) central-directory
+    // header; zip_entry_finalize would underflow m_archive_size - ofs on it
+    if (file_stat.m_local_header_ofs > zip->archive.m_archive_size) {
+      return ZIP_ENOHDR;
+    }
 
     entry_mark[i].m_local_header_ofs = file_stat.m_local_header_ofs;
     entry_mark[i].file_index = (ssize_t)-1;
@@ -883,7 +903,6 @@ static int zip_index_update(struct zip_entry_mark_t *entry_mark,
       entry_mark[j].file_index += 1;
     }
   }
-  entry_mark[nxt_index].file_index = last_index;
   return 0;
 }
 
@@ -1019,6 +1038,13 @@ static ssize_t zip_files_move(struct zip_t *zip, mz_uint64 writen_num,
   const size_t page_size = 1 << 12; // 4K
   mz_zip_internal_state *pState = zip->archive.m_pState;
 
+  // moving zero bytes is a no-op; bail out before touching the heap so the
+  // common delete iterations that shift nothing (e.g. trailing entries) do not
+  // pay for a page-sized allocation each time
+  if (length == 0) {
+    return 0;
+  }
+
   mz_uint8 *move_buf = (mz_uint8 *)calloc(1, page_size);
   if (!move_buf) {
     return ZIP_EOOMEM;
@@ -1091,8 +1117,17 @@ static int zip_central_dir_move(mz_zip_internal_state *pState, int begin,
   }
 
   if (next && l_size == 0) {
+    mz_uint8 *shrunk = NULL;
     memmove(pState->m_central_dir.m_p, next, r_size);
-    pState->m_central_dir.m_p = MZ_REALLOC(pState->m_central_dir.m_p, r_size);
+    // shrinking the buffer must also lower m_capacity; otherwise the next
+    // mz_zip_array append sees the stale (larger) capacity, skips its realloc
+    // and writes past the smaller block. keep the old buffer on realloc
+    // failure.
+    shrunk = (mz_uint8 *)MZ_REALLOC(pState->m_central_dir.m_p, r_size);
+    if (shrunk) {
+      pState->m_central_dir.m_p = shrunk;
+      pState->m_central_dir.m_capacity = r_size;
+    }
     {
       int i;
       for (i = end; i < entry_num; i++) {
@@ -1235,6 +1270,17 @@ static ssize_t zip_entries_delete_mark(struct zip_t *zip,
     }
     writen_num += move_length;
     read_num += move_length;
+    move_length = 0;
+  }
+
+  // the per-entry lengths sum to at most the archive size, so a deleted_length
+  // larger than the archive can only come from corrupted/overlapping offsets;
+  // subtracting it would wrap m_archive_size and spin the stream writer's
+  // capacity-doubling loop forever (see #424), so refuse instead of
+  // underflowing
+  if ((mz_uint64)deleted_length > zip->archive.m_archive_size) {
+    CLEANUP(deleted_entry_flag_array);
+    return ZIP_EINVIDX;
   }
 
   zip->archive.m_archive_size -= (mz_uint64)deleted_length;
@@ -2504,7 +2550,10 @@ ssize_t zip_entry_noallocreadwithoffset(struct zip_t *zip, size_t offset,
     return (ssize_t)ZIP_EINVAL;
   }
 
-  if ((offset + size) > (size_t)zip->entry.uncomp_size) {
+  // offset < uncomp_size here, so test size against the remaining bytes; the
+  // original offset + size form wraps when size is near SIZE_MAX, skipping the
+  // clamp and leaving size huge for the memcpy below
+  if (size > (size_t)zip->entry.uncomp_size - offset) {
     size = (size_t)(zip->entry.uncomp_size - (mz_uint64)offset);
   }
 
@@ -2525,7 +2574,7 @@ ssize_t zip_entry_noallocreadwithoffset(struct zip_t *zip, size_t offset,
       free(heap_buf);
       return (ssize_t)0;
     }
-    if (offset + size > heap_size) {
+    if (size > heap_size - offset) {
       size = heap_size - offset;
     }
     memcpy(buf, (mz_uint8 *)heap_buf + offset, size);
@@ -2534,47 +2583,28 @@ ssize_t zip_entry_noallocreadwithoffset(struct zip_t *zip, size_t offset,
   }
 
   {
-    mz_zip_reader_extract_iter_state *iter =
-        mz_zip_reader_extract_iter_new(pzip, (mz_uint)zip->entry.index, 0);
-    mz_uint8 *writebuf = (mz_uint8 *)buf;
-    size_t file_offset = 0;
-    size_t write_cursor = 0;
-    size_t to_read = size;
+    void *heap_buf = NULL;
+    size_t heap_size = 0;
 
-    if (!iter) {
+    // the streaming iterator (mz_zip_reader_extract_iter_*) spins forever on a
+    // memory-backed archive whose entry data does not inflate to the declared
+    // uncompressed size, so decode the whole entry up front like the password
+    // branch above and copy out the requested window
+    heap_buf = mz_zip_reader_extract_to_heap(pzip, (mz_uint)zip->entry.index,
+                                             &heap_size, 0);
+    if (!heap_buf) {
       return (ssize_t)ZIP_ENORITER;
     }
-
-    while (file_offset < zip->entry.uncomp_size && to_read > 0) {
-      size_t nread = mz_zip_reader_extract_iter_read(
-          iter, (void *)&writebuf[write_cursor], to_read);
-
-      if (nread == 0)
-        break;
-
-      if (offset < (file_offset + nread)) {
-        size_t read_cursor = offset - file_offset;
-        size_t read_size = nread - read_cursor;
-        MZ_ASSERT(read_cursor < size);
-
-        if (to_read < read_size)
-          read_size = to_read;
-        MZ_ASSERT(read_size <= size);
-
-        if (read_cursor != 0) {
-          memmove(&writebuf[write_cursor], &writebuf[read_cursor], read_size);
-        }
-
-        write_cursor += read_size;
-        offset += read_size;
-        to_read -= read_size;
-      }
-
-      file_offset += nread;
+    if (offset >= heap_size) {
+      free(heap_buf);
+      return (ssize_t)0;
     }
-
-    mz_zip_reader_extract_iter_free(iter);
-    return (ssize_t)write_cursor;
+    if (size > heap_size - offset) {
+      size = heap_size - offset;
+    }
+    memcpy(buf, (mz_uint8 *)heap_buf + offset, size);
+    free(heap_buf);
+    return (ssize_t)size;
   }
 }
 
