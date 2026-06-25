@@ -76,6 +76,7 @@
     }                                                                          \
   } while (0)
 
+#define UNX_IFMT 0170000   /* Unix file-type mask */
 #define UNX_IFDIR 0040000  /* Unix directory */
 #define UNX_IFREG 0100000  /* Unix regular file */
 #define UNX_IFSOCK 0140000 /* Unix socket (BSD, not SysV or Amiga) */
@@ -540,8 +541,9 @@ static mz_bool zip_stat_is_symlink(mz_uint16 version_made_by,
   mz_bool is_unix_or_macos =
       ((version_made_by >> 8) == 3) || ((version_made_by >> 8) == 19);
 
-  // and has sym link attribute (0x80 is file, 0x40 is directory)
-  return is_unix_or_macos && (external_attr & (0x20 << 24));
+  // and the Unix file-type field marks it a symbolic link; test the whole
+  // type field, not a single bit that block/char device modes also set
+  return is_unix_or_macos && (((external_attr >> 16) & UNX_IFMT) == UNX_IFLNK);
 }
 
 #if ZIP_ENABLE_INFLATE
@@ -1252,27 +1254,51 @@ static ssize_t zip_entries_delete_mark(struct zip_t *zip,
 #endif /* MINIZ_NO_STDIO */
   }
 
+  // file regions sit on disk in local-header-offset order, which need not match
+  // central-directory order. zip_entry_finalize already ranked every entry by
+  // offset in file_index; walk the entries in that physical order so writen_num
+  // and read_num track real file positions and a MOVE entry's offset is rebased
+  // by exactly the bytes deleted before it. Iterating in central-dir order
+  // corrupts surviving entries when an archive's two orders differ.
+  int *offset_order = (int *)calloc(entry_num, sizeof(int));
+  if (offset_order == NULL) {
+    CLEANUP(deleted_entry_flag_array);
+    return ZIP_EOOMEM;
+  }
+  for (i = 0; i < entry_num; i++) {
+    ssize_t rank = entry_mark[i].file_index;
+    if (rank < 0 || rank >= entry_num) {
+      CLEANUP(offset_order);
+      CLEANUP(deleted_entry_flag_array);
+      return ZIP_EINVIDX;
+    }
+    offset_order[rank] = i;
+  }
+
+  i = 0;
   while (i < entry_num) {
-    while ((i < entry_num) && (entry_mark[i].type == MZ_KEEP)) {
-      writen_num += entry_mark[i].lf_length;
+    while ((i < entry_num) && (entry_mark[offset_order[i]].type == MZ_KEEP)) {
+      writen_num += entry_mark[offset_order[i]].lf_length;
       read_num = writen_num;
       i++;
     }
 
-    while ((i < entry_num) && (entry_mark[i].type == MZ_DELETE)) {
-      deleted_entry_flag_array[i] = MZ_TRUE;
-      read_num += entry_mark[i].lf_length;
-      deleted_length += entry_mark[i].lf_length;
+    while ((i < entry_num) && (entry_mark[offset_order[i]].type == MZ_DELETE)) {
+      deleted_entry_flag_array[offset_order[i]] = MZ_TRUE;
+      read_num += entry_mark[offset_order[i]].lf_length;
+      deleted_length += entry_mark[offset_order[i]].lf_length;
       i++;
       deleted_entry_num++;
     }
 
-    while ((i < entry_num) && (entry_mark[i].type == MZ_MOVE)) {
-      move_length += entry_mark[i].lf_length;
+    while ((i < entry_num) && (entry_mark[offset_order[i]].type == MZ_MOVE)) {
+      move_length += entry_mark[offset_order[i]].lf_length;
       mz_uint8 *p = &MZ_ZIP_ARRAY_ELEMENT(
           &pState->m_central_dir, mz_uint8,
-          MZ_ZIP_ARRAY_ELEMENT(&pState->m_central_dir_offsets, mz_uint32, i));
+          MZ_ZIP_ARRAY_ELEMENT(&pState->m_central_dir_offsets, mz_uint32,
+                               offset_order[i]));
       if (!p) {
+        CLEANUP(offset_order);
         CLEANUP(deleted_entry_flag_array);
         return ZIP_ENOENT;
       }
@@ -1284,6 +1310,7 @@ static ssize_t zip_entries_delete_mark(struct zip_t *zip,
 
     n = zip_files_move(zip, writen_num, read_num, move_length);
     if (n != (ssize_t)move_length) {
+      CLEANUP(offset_order);
       CLEANUP(deleted_entry_flag_array);
       return n;
     }
@@ -1291,6 +1318,7 @@ static ssize_t zip_entries_delete_mark(struct zip_t *zip,
     read_num += move_length;
     move_length = 0;
   }
+  CLEANUP(offset_order);
 
   // the per-entry lengths sum to at most the archive size, so a deleted_length
   // larger than the archive can only come from corrupted/overlapping offsets;
