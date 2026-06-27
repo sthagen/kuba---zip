@@ -918,6 +918,60 @@ MU_TEST(test_entries_delete_stream_multi_copy) {
   free(copy2);
 }
 
+MU_TEST(test_entries_delete_stream_add_grow) {
+  // In-memory delete mode aliases the caller's stream buffer as the archive's
+  // working memory (mz_zip_reader_init_mem stores it verbatim). Adding an entry
+  // grows the archive past the original size; the writer must work on its own
+  // copy rather than realloc-and-free the caller's buffer, which the caller
+  // still owns and frees after zip_stream_close.
+  const char *names[] = {"a.txt", "b.txt"};
+  struct zip_t *zw =
+      zip_stream_open(NULL, 0, ZIP_DEFAULT_COMPRESSION_LEVEL, 'w');
+  mu_check(zw != NULL);
+  for (size_t i = 0; i < 2; ++i) {
+    mu_assert_int_eq(0, zip_entry_open(zw, names[i]));
+    mu_assert_int_eq(0, zip_entry_write(zw, TESTDATA1, strlen(TESTDATA1)));
+    mu_assert_int_eq(0, zip_entry_close(zw));
+  }
+  void *zdata = NULL;
+  size_t zsize = 0;
+  mu_check(zip_stream_copy(zw, &zdata, &zsize) > 0);
+  zip_stream_close(zw);
+
+  const size_t biglen = 8192;
+  char *big = (char *)malloc(biglen);
+  mu_check(big != NULL);
+  memset(big, 'Z', biglen);
+
+  // store (level 0) so the added entry grows the archive well past zsize and
+  // the working buffer has to relocate
+  struct zip_t *zip = zip_stream_open((const char *)zdata, zsize, 0, 'd');
+  mu_check(zip != NULL);
+  mu_assert_int_eq(0, zip_entry_open(zip, "big.bin"));
+  mu_assert_int_eq(0, zip_entry_write(zip, big, biglen));
+  mu_assert_int_eq(0, zip_entry_close(zip));
+
+  void *outdata = NULL;
+  size_t outsize = 0;
+  mu_check(zip_stream_copy(zip, &outdata, &outsize) > 0);
+  zip_stream_close(zip);
+  free(zdata); // caller still owns the original buffer; must not double-free
+  free(big);
+
+  zip = zip_stream_open((const char *)outdata, outsize, 0, 'r');
+  mu_check(zip != NULL);
+  mu_assert_int_eq(3, zip_entries_total(zip));
+  mu_assert_int_eq(0, zip_entry_open(zip, "big.bin"));
+  mu_assert_int_eq((int)biglen, zip_entry_size(zip));
+  mu_assert_int_eq(0, zip_entry_close(zip));
+  for (size_t i = 0; i < 2; ++i) {
+    mu_assert_int_eq(0, zip_entry_open(zip, names[i]));
+    mu_assert_int_eq(0, zip_entry_close(zip));
+  }
+  zip_stream_close(zip);
+  free(outdata);
+}
+
 static unsigned int te_rd32(const unsigned char *p) {
   return (unsigned int)p[0] | ((unsigned int)p[1] << 8) |
          ((unsigned int)p[2] << 16) | ((unsigned int)p[3] << 24);
@@ -1231,6 +1285,53 @@ MU_TEST(test_entry_offset) {
   zip_close(zip);
 }
 
+MU_TEST(test_entries_delete_multirun_offsets) {
+  // delete two separated runs of entries, the first starting at index 0 so the
+  // central-dir buffer is realloc-shrunk, then keep operating on the same
+  // handle. the offsets-array compaction used to copy the whole tail (including
+  // deleted slots not yet processed) into the survivor slots, so a survivor's
+  // offset was overwritten with a stale deleted-entry offset that points past
+  // the shrunk buffer; the next index lookup then reads out of bounds. names
+  // have varying lengths so the central-dir records differ in size.
+  char name[L_tmpnam + 1] = {0};
+  strncpy(name, "z-XXXXXX\0", L_tmpnam);
+  MKTEMP(name);
+
+  const char *names[] = {"f0",        "file1", "kept_c",    "f3",
+                         "file4xxxx", "keptF", "keptG_long"};
+  struct zip_t *zip = zip_open(name, 0, 'w');
+  mu_check(zip != NULL);
+  for (size_t i = 0; i < 7; ++i) {
+    mu_assert_int_eq(0, zip_entry_open(zip, names[i]));
+    mu_assert_int_eq(0, zip_entry_write(zip, TESTDATA1, strlen(TESTDATA1)));
+    mu_assert_int_eq(0, zip_entry_close(zip));
+  }
+  zip_close(zip);
+
+  // remove indices {0,1,3,4} -> survivors kept_c, keptF, keptG_long; then drop
+  // the first survivor (kept_c) on the same handle
+  zip = zip_open(name, 0, 'd');
+  mu_check(zip != NULL);
+  size_t del1[] = {0, 1, 3, 4};
+  mu_assert_int_eq(4, zip_entries_deletebyindex(zip, del1, 4));
+  size_t del2[] = {0};
+  mu_assert_int_eq(1, zip_entries_deletebyindex(zip, del2, 1));
+  zip_close(zip);
+
+  zip = zip_open(name, 0, 'r');
+  mu_check(zip != NULL);
+  mu_assert_int_eq(2, zip_entries_total(zip));
+  mu_assert_int_eq(0, zip_entry_open(zip, "keptF"));
+  mu_assert_int_eq(0, zip_entry_close(zip));
+  mu_assert_int_eq(0, zip_entry_open(zip, "keptG_long"));
+  mu_assert_int_eq(0, zip_entry_close(zip));
+  mu_assert_int_eq(ZIP_ENOENT, zip_entry_open(zip, "kept_c"));
+  mu_assert_int_eq(0, zip_entry_close(zip));
+  zip_close(zip);
+
+  UNLINK(name);
+}
+
 MU_TEST_SUITE(test_entry_suite) {
   MU_SUITE_CONFIGURE(&test_setup, &test_teardown);
 
@@ -1255,9 +1356,11 @@ MU_TEST_SUITE(test_entry_suite) {
   MU_RUN_TEST(test_entries_delete_stream_open_close);
   MU_RUN_TEST(test_entries_delete_stream_all);
   MU_RUN_TEST(test_entries_delete_stream_multi_copy);
+  MU_RUN_TEST(test_entries_delete_stream_add_grow);
   MU_RUN_TEST(test_entries_delete_badoffset);
   MU_RUN_TEST(test_entries_delete_reordered_cd);
   MU_RUN_TEST(test_entries_delete_reordered_cd_data);
+  MU_RUN_TEST(test_entries_delete_multirun_offsets);
   MU_RUN_TEST(test_entry_offset);
 }
 

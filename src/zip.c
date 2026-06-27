@@ -112,8 +112,20 @@ static size_t zip_stream_delete_write_func(void *pOpaque, mz_uint64 file_ofs,
     size_t new_capacity = MZ_MAX(64, pState->m_mem_capacity);
     while (new_capacity < new_size)
       new_capacity *= 2;
-    if (NULL == (pNew_block = pZip->m_pRealloc(
-                     pZip->m_pAlloc_opaque, pState->m_pMem, 1, new_capacity))) {
+    if (pState->m_mem_capacity == 0) {
+      // m_pMem still aliases the caller-owned buffer passed to zip_stream_open
+      // (mz_zip_reader_init_mem stores it verbatim, leaving m_mem_capacity 0).
+      // Reallocating it would move and free a buffer the caller still owns and
+      // frees; copy into a library-owned block and leave the caller's intact.
+      pNew_block = pZip->m_pAlloc(pZip->m_pAlloc_opaque, 1, new_capacity);
+      if (pNew_block) {
+        memcpy(pNew_block, pState->m_pMem, (size_t)pState->m_mem_size);
+      }
+    } else {
+      pNew_block = pZip->m_pRealloc(pZip->m_pAlloc_opaque, pState->m_pMem, 1,
+                                    new_capacity);
+    }
+    if (NULL == pNew_block) {
       mz_zip_set_error(pZip, MZ_ZIP_ALLOC_FAILED);
       return 0;
     }
@@ -1175,7 +1187,6 @@ static int zip_central_dir_delete(mz_zip_internal_state *pState,
   int i = 0;
   int begin = 0;
   int end = 0;
-  int d_num = 0;
   while (i < entry_num) {
     while ((i < entry_num) && (!deleted_entry_index_array[i])) {
       i++;
@@ -1189,36 +1200,26 @@ static int zip_central_dir_delete(mz_zip_internal_state *pState,
     zip_central_dir_move(pState, begin, end, entry_num);
   }
 
-  i = 0;
-  while (i < entry_num) {
-    while ((i < entry_num) && (!deleted_entry_index_array[i])) {
-      i++;
+  // every surviving entry already holds its rebased offset at its original
+  // index after the moves above, so pack the offsets down in one stable pass.
+  // the old per-run compaction copied the whole tail (including deleted slots
+  // not yet processed) into the survivor slots, so with two or more separated
+  // delete runs a survivor's offset was overwritten by a stale deleted-entry
+  // offset that points past the realloc-shrunk central directory; the next
+  // index lookup (zip_entry_openbyindex) then read out of bounds.
+  // m_central_dir_offsets holds one mz_uint32 element per file and m_size is an
+  // element count, not a byte count.
+  {
+    int w = 0;
+    for (i = 0; i < entry_num; i++) {
+      if (!deleted_entry_index_array[i]) {
+        MZ_ZIP_ARRAY_ELEMENT(&pState->m_central_dir_offsets, mz_uint32, w) =
+            MZ_ZIP_ARRAY_ELEMENT(&pState->m_central_dir_offsets, mz_uint32, i);
+        w++;
+      }
     }
-    begin = i;
-    if (begin == entry_num) {
-      break;
-    }
-    while ((i < entry_num) && (deleted_entry_index_array[i])) {
-      i++;
-    }
-    end = i;
-    int k = 0, j;
-    for (j = end; j < entry_num; j++) {
-      MZ_ZIP_ARRAY_ELEMENT(&pState->m_central_dir_offsets, mz_uint32,
-                           begin + k) =
-          (mz_uint32)MZ_ZIP_ARRAY_ELEMENT(&pState->m_central_dir_offsets,
-                                          mz_uint32, j);
-      k++;
-    }
-    d_num += end - begin;
+    pState->m_central_dir_offsets.m_size = (size_t)w;
   }
-
-  // m_central_dir_offsets stores one mz_uint32 element per file, and m_size is
-  // an element count (set to m_total_files by the reader), not a byte count;
-  // multiplying by sizeof(mz_uint32) left it four times too large, so a later
-  // add wrote the new record's offset far past the live entries and stale slots
-  // were consumed as real central-dir offsets
-  pState->m_central_dir_offsets.m_size = (size_t)(entry_num - d_num);
   return 0;
 }
 
@@ -2956,6 +2957,12 @@ struct zip_t *zip_stream_openwitherror(const char *stream, size_t size,
         goto cleanup;
       }
       zip->archive.m_pWrite = zip_stream_delete_write_func;
+      // init_from_reader sets m_mem_capacity to the size of the caller-owned
+      // stream buffer and assumes it is heap-resizable. It is not ours to
+      // resize, so clear the capacity: the first write then copies it into a
+      // library-owned block (see zip_stream_delete_write_func) and a non-zero
+      // capacity afterwards reliably marks that owned block.
+      zip->archive.m_pState->m_mem_capacity = 0;
     } else {
       *errnum = ZIP_EINVMODE;
       goto cleanup;
@@ -3023,6 +3030,17 @@ ssize_t zip_stream_copy(struct zip_t *zip, void **buf, size_t *bufsize) {
 void zip_stream_close(struct zip_t *zip) {
   if (zip) {
 #if ZIP_ENABLE_DEFLATE
+    // in-memory delete mode grows a library-owned working copy of the archive
+    // in zip_stream_delete_write_func (m_mem_capacity becomes non-zero);
+    // release it here. writer_end leaves m_pMem alone for this write func,
+    // which is what keeps the caller's original stream buffer untouched.
+    if (zip->archive.m_pWrite == zip_stream_delete_write_func &&
+        zip->archive.m_pState && zip->archive.m_pState->m_pMem &&
+        zip->archive.m_pState->m_mem_capacity != 0) {
+      zip->archive.m_pFree(zip->archive.m_pAlloc_opaque,
+                           zip->archive.m_pState->m_pMem);
+      zip->archive.m_pState->m_pMem = NULL;
+    }
     mz_zip_writer_end(&(zip->archive));
 #endif
 #if ZIP_ENABLE_INFLATE
