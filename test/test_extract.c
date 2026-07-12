@@ -383,6 +383,33 @@ MU_TEST(test_extract_symlink_backslash_climb_rejected) {
   mu_check(system(rm) == 0);
 }
 
+MU_TEST(test_extract_symlink_chained_climb_rejected) {
+  // "a" -> "." is a harmless in-tree self link, but a later link whose target
+  // descends through it and then climbs ("a/../secret") escapes the root: the
+  // kernel resolves "a/.." from a's target (the extraction dir) so it lands in
+  // the parent. the lexical depth stays non-negative, so containment must also
+  // reject a ".." that follows a normal component.
+  static const struct sym_entry_t entries[] = {
+      {"a", ".", 1},
+      {"b", "a/../secret", 1},
+  };
+  char tmpl[] = "ext-XXXXXX";
+  char *dir = mkdtemp(tmpl);
+  char victim[512];
+  struct stat st;
+  mu_check(dir != NULL);
+
+  sym_write_zip(ZIPNAME, entries, 2);
+  mu_assert_int_eq(ZIP_EINVENTNAME, zip_extract(ZIPNAME, dir, NULL, NULL));
+
+  snprintf(victim, sizeof(victim), "%s/b", dir);
+  mu_check(lstat(victim, &st) != 0);
+
+  char rm[512];
+  snprintf(rm, sizeof(rm), "rm -rf %s", dir);
+  mu_check(system(rm) == 0);
+}
+
 MU_TEST(test_extract_symlink_dirflag_rejected) {
   // a symlink entry flagged as a directory carries no data, so the no-alloc
   // extractor leaves symlink_to untouched; without the guard "victim" would be
@@ -470,6 +497,88 @@ MU_TEST(test_extract_chardev_not_symlink) {
   snprintf(rm, sizeof(rm), "rm -rf %s", dir);
   mu_check(system(rm) == 0);
 }
+
+MU_TEST(test_extract_dotdot_name_chmod_rejected) {
+  // an entry whose name normalizes to "" (e.g. "..") makes the extraction path
+  // collapse to the destination directory itself; a directory-flagged entry
+  // then chmods the destination to the archive's mode. it must be rejected.
+  static const struct sym_entry_t entries[] = {
+      {"..", "", 0, 1, 0x01FF0000UL}, // dir flag + unix mode 0777
+  };
+  char tmpl[] = "ext-XXXXXX";
+  char *dir = mkdtemp(tmpl);
+  struct stat st;
+  char rm[512];
+  mu_check(dir != NULL);
+  mu_check(chmod(dir, 0700) == 0);
+
+  sym_write_zip(ZIPNAME, entries, 1);
+  mu_assert_int_eq(ZIP_EINVENTNAME, zip_extract(ZIPNAME, dir, NULL, NULL));
+
+  // the destination directory keeps its original permissions
+  mu_assert_int_eq(0, stat(dir, &st));
+  mu_assert_int_eq(0700, (int)(st.st_mode & 0777));
+
+  snprintf(rm, sizeof(rm), "rm -rf %s", dir);
+  mu_check(system(rm) == 0);
+}
+
+MU_TEST(test_extract_symlink_writethrough_rejected) {
+  // a regular entry whose name matches a symlink stored earlier in the same
+  // archive is written with fopen("wb"), which would follow that link and write
+  // through it, clobbering the link target instead of creating the named file.
+  // extraction removes the stale symlink first, so the bytes land at the named
+  // path and the link target is left untouched.
+  static const struct sym_entry_t entries[] = {
+      {"config", "victim", 1, 0},   // symlink config -> victim (in-tree target)
+      {"config", "ATTACKER", 0, 0}, // regular file of the same name
+  };
+  char tmpl[] = "ext-XXXXXX";
+  char *dir = mkdtemp(tmpl);
+  char victim[512];
+  char config[512];
+  char content[32];
+  char rm[512];
+  struct stat st;
+  FILE *fp;
+  size_t nread;
+  mu_check(dir != NULL);
+
+  // a pre-existing file in the destination that the link points at
+  snprintf(victim, sizeof(victim), "%s/victim", dir);
+  fp = fopen(victim, "wb");
+  mu_check(fp != NULL);
+  mu_check(fwrite("ORIGINAL", 1, 8, fp) == 8);
+  fclose(fp);
+
+  sym_write_zip(ZIPNAME, entries, sizeof(entries) / sizeof(entries[0]));
+  mu_assert_int_eq(0, zip_extract(ZIPNAME, dir, NULL, NULL));
+
+  // the link target keeps its original bytes; nothing was written through it
+  fp = fopen(victim, "rb");
+  mu_check(fp != NULL);
+  memset(content, 0, sizeof(content));
+  nread = fread(content, 1, sizeof(content) - 1, fp);
+  fclose(fp);
+  mu_assert_int_eq(8, (int)nread);
+  mu_assert_int_eq(0, strncmp(content, "ORIGINAL", 8));
+
+  // the named path is now a regular file holding the entry's own bytes, not a
+  // link
+  snprintf(config, sizeof(config), "%s/config", dir);
+  mu_assert_int_eq(0, lstat(config, &st));
+  mu_check(S_ISREG(st.st_mode));
+  fp = fopen(config, "rb");
+  mu_check(fp != NULL);
+  memset(content, 0, sizeof(content));
+  nread = fread(content, 1, sizeof(content) - 1, fp);
+  fclose(fp);
+  mu_assert_int_eq((int)strlen("ATTACKER"), (int)nread);
+  mu_assert_int_eq(0, strncmp(content, "ATTACKER", nread));
+
+  snprintf(rm, sizeof(rm), "rm -rf %s", dir);
+  mu_check(system(rm) == 0);
+}
 #endif
 
 #if ZIP_HAVE_SYMLINK
@@ -522,10 +631,13 @@ MU_TEST_SUITE(test_extract_suite) {
   MU_RUN_TEST(test_extract_symlink_absolute_rejected);
   MU_RUN_TEST(test_extract_symlink_climb_rejected);
   MU_RUN_TEST(test_extract_symlink_backslash_climb_rejected);
+  MU_RUN_TEST(test_extract_symlink_chained_climb_rejected);
   MU_RUN_TEST(test_extract_symlink_dirflag_rejected);
   MU_RUN_TEST(test_extract_symlink_zerolen_first_rejected);
   MU_RUN_TEST(test_extract_symlink_longname_rejected);
   MU_RUN_TEST(test_extract_chardev_not_symlink);
+  MU_RUN_TEST(test_extract_dotdot_name_chmod_rejected);
+  MU_RUN_TEST(test_extract_symlink_writethrough_rejected);
 #endif
 }
 

@@ -569,6 +569,7 @@ static mz_bool zip_stat_is_symlink(mz_uint16 version_made_by,
 static mz_bool zip_symlink_target_escapes(const char *link_name,
                                           const char *target) {
   long depth = 0;
+  mz_bool descended = MZ_FALSE;
   const char *p;
 
   // symlink() stores the target verbatim and POSIX resolves it with '/' as the
@@ -596,10 +597,18 @@ static mz_bool zip_symlink_target_escapes(const char *link_name,
       ++len;
     }
     if (len == 2 && seg[0] == '.' && seg[1] == '.') {
-      if (--depth < 0) {
+      // a ".." after a normal component is unsafe even when the running depth
+      // stays non-negative: that earlier component may itself be an in-tree
+      // symlink from a previous entry (e.g. "a" -> "."), so the kernel resolves
+      // "a/.." from a's target rather than from this directory and the link
+      // escapes the root. Only leading ".." (climbing the link's own real
+      // parents, which zip_mkpath refuses to descend through a symlink) is
+      // safe, bounded by the depth count.
+      if (descended || --depth < 0) {
         return MZ_TRUE;
       }
     } else if (!(len == 0 || (len == 1 && seg[0] == '.'))) {
+      descended = MZ_TRUE;
       ++depth;
     }
     while (*p == '/') {
@@ -669,6 +678,16 @@ static int zip_archive_extract(mz_zip_archive *zip_archive, const char *dir,
       goto out;
     }
 
+    // a name built only from separators and "."/".." components (e.g. "..",
+    // "/", "./") normalizes to an empty string, so the path below collapses to
+    // the destination directory itself: a directory-flagged entry would then
+    // CHMOD the destination to the archive's mode and a regular entry would try
+    // to write over it
+    if (info.m_filename[0] == '\0') {
+      err = ZIP_EINVENTNAME;
+      goto out;
+    }
+
     // a name that does not fit gets silently truncated by the copy below; the
     // symlink branch then measures escape depth from the full name while the
     // link is created at the shortened path, so a long name plus a climbing
@@ -722,6 +741,24 @@ static int zip_archive_extract(mz_zip_archive *zip_archive, const char *dir,
       }
 #endif
     } else {
+#if ZIP_HAVE_SYMLINK
+      // an earlier entry (or a pre-existing file) can leave a symlink at this
+      // path; the fopen("wb") inside mz_zip_reader_extract_to_file and the
+      // CHMOD below both follow it, so a regular entry of the same name would
+      // write through the link onto its target. remove the link first so the
+      // bytes land at the named path instead. this only covers a symlink as the
+      // final path component; a symlinked intermediate directory is not caught
+      // here.
+      {
+        struct MZ_FILE_STAT_STRUCT path_st;
+        if (lstat(path, &path_st) == 0 && S_ISLNK(path_st.st_mode)) {
+          if (unlink(path) != 0) {
+            err = ZIP_ESYMLINK;
+            goto out;
+          }
+        }
+      }
+#endif
       if (!mz_zip_reader_is_file_a_directory(zip_archive, i)) {
         if (!mz_zip_reader_extract_to_file(zip_archive, i, path, 0)) {
           // Cannot extract zip archive to file
