@@ -972,6 +972,57 @@ MU_TEST(test_entries_delete_stream_add_grow) {
   free(outdata);
 }
 
+MU_TEST(test_entries_delete_stream_buffer_untouched) {
+  // In-memory delete mode compacts surviving entries by shifting their data in
+  // place. That shift must run on a library-owned copy, not on the caller's
+  // stream buffer (which the caller still owns): writing through it crashes on
+  // a read-only backing and silently corrupts a writable one. Deleting the
+  // first entry makes the second a MOVE, so the compaction shift runs.
+  const char *names[] = {"a.txt", "b.txt"};
+  struct zip_t *zw =
+      zip_stream_open(NULL, 0, ZIP_DEFAULT_COMPRESSION_LEVEL, 'w');
+  mu_check(zw != NULL);
+  for (size_t i = 0; i < 2; ++i) {
+    mu_assert_int_eq(0, zip_entry_open(zw, names[i]));
+    mu_assert_int_eq(0, zip_entry_write(zw, TESTDATA1, strlen(TESTDATA1)));
+    mu_assert_int_eq(0, zip_entry_close(zw));
+  }
+  void *zdata = NULL;
+  size_t zsize = 0;
+  mu_check(zip_stream_copy(zw, &zdata, &zsize) > 0);
+  zip_stream_close(zw);
+
+  char *pristine = (char *)malloc(zsize);
+  mu_check(pristine != NULL);
+  memcpy(pristine, zdata, zsize);
+
+  struct zip_t *zip = zip_stream_open((const char *)zdata, zsize, 0, 'd');
+  mu_check(zip != NULL);
+  char *entries[] = {"a.txt"};
+  mu_assert_int_eq(1, zip_entries_delete(zip, entries, 1));
+
+  void *outdata = NULL;
+  size_t outsize = 0;
+  mu_check(zip_stream_copy(zip, &outdata, &outsize) > 0);
+  zip_stream_close(zip);
+
+  // the caller's buffer must be byte-for-byte what it was before the delete
+  mu_assert_int_eq(0, memcmp(zdata, pristine, zsize));
+
+  free(pristine);
+  free(zdata);
+
+  zip = zip_stream_open((const char *)outdata, outsize, 0, 'r');
+  mu_check(zip != NULL);
+  mu_assert_int_eq(1, zip_entries_total(zip));
+  mu_assert_int_eq(ZIP_ENOENT, zip_entry_open(zip, "a.txt"));
+  mu_assert_int_eq(0, zip_entry_close(zip));
+  mu_assert_int_eq(0, zip_entry_open(zip, "b.txt"));
+  mu_assert_int_eq(0, zip_entry_close(zip));
+  zip_stream_close(zip);
+  free(outdata);
+}
+
 static unsigned int te_rd32(const unsigned char *p) {
   return (unsigned int)p[0] | ((unsigned int)p[1] << 8) |
          ((unsigned int)p[2] << 16) | ((unsigned int)p[3] << 24);
@@ -1070,6 +1121,107 @@ MU_TEST(test_entries_delete_badoffset) {
   free(buf);
   free(ne);
   free(nb);
+}
+
+// A zip64 entry keeps 0xFFFFFFFF in the 32-bit central-directory offset field
+// and stores the real local-header offset in a zip64 extra field. Deleting a
+// preceding entry shifts its data, and zip_entries_delete_mark rebased the raw
+// 32-bit field, corrupting the sentinel and leaving the extra-field offset
+// stale, so the surviving entry became unlocatable (read failed). The rebase
+// must update the offset where it actually lives and keep the entry readable.
+MU_TEST(test_entries_delete_zip64_offset) {
+  struct zip_t *zip = zip_stream_open(NULL, 0, 0, 'w');
+  mu_check(zip != NULL);
+  zip_entry_open(zip, "a.txt");
+  zip_entry_write(zip, TESTDATA1, strlen(TESTDATA1));
+  zip_entry_close(zip);
+  zip_entry_open(zip, "b.txt");
+  zip_entry_write(zip, TESTDATA2, strlen(TESTDATA2));
+  zip_entry_close(zip);
+
+  void *buf = NULL;
+  size_t bufsize = 0;
+  mu_check(zip_stream_copy(zip, &buf, &bufsize) > 0);
+  zip_stream_close(zip);
+
+  unsigned char *b = (unsigned char *)buf;
+  ssize_t eocd = -1, i;
+  for (i = (ssize_t)bufsize - 22; i >= 0; i--) {
+    if (te_rd32(b + i) == 0x06054b50) {
+      eocd = i;
+      break;
+    }
+  }
+  mu_check(eocd >= 0);
+
+  unsigned int cd_ofs = te_rd32(b + eocd + 16);
+  unsigned char *p0 = b + cd_ofs;
+  unsigned int hdr0 =
+      46u + te_rd16(p0 + 28) + te_rd16(p0 + 30) + te_rd16(p0 + 32);
+  unsigned char *p1 = p0 + hdr0; // b.txt central-directory record
+  unsigned short fn1 = te_rd16(p1 + 28), ex1 = te_rd16(p1 + 30),
+                 cm1 = te_rd16(p1 + 32);
+  unsigned int real_comp = te_rd32(p1 + 20);
+  unsigned int real_ofs = te_rd32(p1 + 42);
+
+  // re-encode b.txt with zip64 comp-size and local-offset sentinels; the real
+  // values go into a zip64 extended-information extra field
+  unsigned char z64[4 + 16];
+  te_wr16(z64, 0x0001);
+  te_wr16(z64 + 2, 16);
+  te_wr64(z64 + 4, real_comp);
+  te_wr64(z64 + 12, real_ofs);
+
+  unsigned short newex1 = sizeof(z64);
+  size_t newhdr1 = 46u + fn1 + newex1 + cm1;
+  unsigned char *ne = (unsigned char *)calloc(1, newhdr1);
+  mu_check(ne != NULL);
+  memcpy(ne, p1, 46u + fn1);
+  memcpy(ne + 46u + fn1, z64, sizeof(z64));
+  memcpy(ne + 46u + fn1 + newex1, p1 + 46u + fn1 + ex1, cm1);
+  te_wr32(ne + 20, 0xFFFFFFFF); // comp size sentinel
+  te_wr32(ne + 42, 0xFFFFFFFF); // local-header offset sentinel
+  te_wr16(ne + 30, newex1);
+
+  size_t cd_new_len = hdr0 + newhdr1;
+  size_t eocd_len = bufsize - (size_t)eocd;
+  size_t total_new = cd_ofs + cd_new_len + eocd_len;
+  unsigned char *nb = (unsigned char *)calloc(1, total_new);
+  mu_check(nb != NULL);
+  memcpy(nb, b, cd_ofs);
+  memcpy(nb + cd_ofs, p0, hdr0);
+  memcpy(nb + cd_ofs + hdr0, ne, newhdr1);
+  memcpy(nb + cd_ofs + cd_new_len, b + eocd, eocd_len);
+  te_wr32(nb + cd_ofs + cd_new_len + 12, (unsigned int)cd_new_len);
+  te_wr32(nb + cd_ofs + cd_new_len + 16, cd_ofs);
+
+  // deleting a.txt shifts b.txt to the front of the archive
+  struct zip_t *zd = zip_stream_open((const char *)nb, total_new, 0, 'd');
+  mu_check(zd != NULL);
+  char *del[] = {"a.txt"};
+  mu_assert_int_eq(1, (int)zip_entries_delete(zd, del, 1));
+  void *out = NULL;
+  size_t outsize = 0;
+  mu_check(zip_stream_copy(zd, &out, &outsize) > 0);
+  zip_stream_close(zd);
+
+  struct zip_t *zr = zip_stream_open((const char *)out, outsize, 0, 'r');
+  mu_check(zr != NULL);
+  mu_assert_int_eq(1, (int)zip_entries_total(zr));
+  mu_assert_int_eq(0, zip_entry_open(zr, "b.txt"));
+  void *rd = NULL;
+  size_t rdsize = 0;
+  mu_assert_int_eq((int)strlen(TESTDATA2),
+                   (int)zip_entry_read(zr, &rd, &rdsize));
+  mu_check(rd != NULL && memcmp(rd, TESTDATA2, strlen(TESTDATA2)) == 0);
+  free(rd);
+  zip_entry_close(zr);
+  zip_stream_close(zr);
+
+  free(buf);
+  free(ne);
+  free(nb);
+  free(out);
 }
 
 // When the central-directory records are not stored in local-header-offset
@@ -1332,6 +1484,84 @@ MU_TEST(test_entries_delete_multirun_offsets) {
   UNLINK(name);
 }
 
+MU_TEST(test_entries_delete_stub_prefixed) {
+  // a file archive can begin at a nonzero offset (a self-extracting stub or any
+  // prepended bytes); miniz records that base in m_file_archive_start_ofs and
+  // its read/write callbacks add it. the delete path's raw file moves used
+  // archive-relative offsets without that base, so on a stub-prefixed archive a
+  // surviving entry was rebuilt from the wrong bytes and read back corrupt.
+  char name[L_tmpnam + 1] = {0};
+  strncpy(name, "z-XXXXXX\0", L_tmpnam);
+  MKTEMP(name);
+
+  const size_t len = 8192;
+  char *payload = (char *)malloc(len * 3);
+  mu_check(payload != NULL);
+  const char *names[] = {"a.bin", "b.bin", "c.bin"};
+
+  struct zip_t *zip = zip_open(name, 0, 'w');
+  mu_check(zip != NULL);
+  for (size_t i = 0; i < 3; ++i) {
+    char *p = payload + i * len;
+    memset(p, (int)('A' + i), len);
+    mu_assert_int_eq(0, zip_entry_open(zip, names[i]));
+    mu_assert_int_eq(0, zip_entry_write(zip, p, len));
+    mu_assert_int_eq(0, zip_entry_close(zip));
+  }
+  zip_close(zip);
+
+  // prepend a stub so the archive no longer starts at file offset 0
+  FILE *f = fopen(name, "rb");
+  mu_check(f != NULL);
+  fseek(f, 0, SEEK_END);
+  long zsize = ftell(f);
+  fseek(f, 0, SEEK_SET);
+  char *zbytes = (char *)malloc((size_t)zsize);
+  mu_check(zbytes != NULL);
+  mu_assert_int_eq(zsize, (long)fread(zbytes, 1, (size_t)zsize, f));
+  fclose(f);
+
+  const size_t stub = 4096;
+  char *sb = (char *)malloc(stub);
+  mu_check(sb != NULL);
+  memset(sb, 'S', stub);
+  f = fopen(name, "wb");
+  mu_check(f != NULL);
+  mu_assert_int_eq((long)stub, (long)fwrite(sb, 1, stub, f));
+  mu_assert_int_eq(zsize, (long)fwrite(zbytes, 1, (size_t)zsize, f));
+  fclose(f);
+  free(sb);
+  free(zbytes);
+
+  // remove the middle entry -> c.bin must shift down over b.bin's old region
+  char *del[] = {"b.bin"};
+  zip = zip_open(name, 0, 'd');
+  mu_check(zip != NULL);
+  mu_assert_int_eq(1, zip_entries_delete(zip, del, 1));
+  zip_close(zip);
+
+  zip = zip_open(name, 0, 'r');
+  mu_check(zip != NULL);
+  mu_assert_int_eq(2, zip_entries_total(zip));
+  const size_t survivors[] = {0, 2};
+  for (size_t s = 0; s < 2; ++s) {
+    size_t i = survivors[s];
+    mu_assert_int_eq(0, zip_entry_open(zip, names[i]));
+    char *buf = NULL;
+    size_t bufsize = 0;
+    ssize_t r = zip_entry_read(zip, (void **)&buf, &bufsize);
+    mu_assert_int_eq((int)len, (int)r);
+    mu_assert_int_eq((int)len, (int)bufsize);
+    mu_assert_int_eq(0, memcmp(buf, payload + i * len, len));
+    mu_assert_int_eq(0, zip_entry_close(zip));
+    free(buf);
+  }
+  zip_close(zip);
+
+  free(payload);
+  UNLINK(name);
+}
+
 MU_TEST_SUITE(test_entry_suite) {
   MU_SUITE_CONFIGURE(&test_setup, &test_teardown);
 
@@ -1357,10 +1587,13 @@ MU_TEST_SUITE(test_entry_suite) {
   MU_RUN_TEST(test_entries_delete_stream_all);
   MU_RUN_TEST(test_entries_delete_stream_multi_copy);
   MU_RUN_TEST(test_entries_delete_stream_add_grow);
+  MU_RUN_TEST(test_entries_delete_stream_buffer_untouched);
   MU_RUN_TEST(test_entries_delete_badoffset);
+  MU_RUN_TEST(test_entries_delete_zip64_offset);
   MU_RUN_TEST(test_entries_delete_reordered_cd);
   MU_RUN_TEST(test_entries_delete_reordered_cd_data);
   MU_RUN_TEST(test_entries_delete_multirun_offsets);
+  MU_RUN_TEST(test_entries_delete_stub_prefixed);
   MU_RUN_TEST(test_entry_offset);
 }
 

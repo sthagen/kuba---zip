@@ -1123,13 +1123,36 @@ static ssize_t zip_files_move(struct zip_t *zip, mz_uint64 writen_num,
 
     if (pState->m_pFile) {
 #ifndef MINIZ_NO_STDIO
-      n = zip_file_move(pState->m_pFile, writen_num, read_num, move_count,
+      // writen_num/read_num are archive-relative; a stub-prefixed file needs
+      // m_file_archive_start_ofs added to reach the real bytes (the memory
+      // path below stays archive-relative, so it is left untouched)
+      n = zip_file_move(pState->m_pFile,
+                        writen_num + pState->m_file_archive_start_ofs,
+                        read_num + pState->m_file_archive_start_ofs, move_count,
                         move_buf, page_size);
 #else
       CLEANUP(move_buf);
       return ZIP_ENOFILE;
 #endif /* MINIZ_NO_STDIO */
     } else if (pState->m_pMem) {
+      // 'd' mode aliases the caller-owned buffer as m_pMem with m_mem_capacity
+      // 0; shifting entry data in place would write through it (a crash on a
+      // read-only backing, silent corruption otherwise). The copy-on-write in
+      // zip_stream_delete_write_func only covers the central-directory write,
+      // so copy into a library-owned block on the first move here too; a
+      // non-zero m_mem_capacity then marks the owned block that
+      // zip_stream_close frees.
+      if (pState->m_mem_capacity == 0) {
+        void *owned = zip->archive.m_pAlloc(zip->archive.m_pAlloc_opaque, 1,
+                                            pState->m_mem_size);
+        if (!owned) {
+          CLEANUP(move_buf);
+          return ZIP_EOOMEM;
+        }
+        memcpy(owned, pState->m_pMem, pState->m_mem_size);
+        pState->m_pMem = owned;
+        pState->m_mem_capacity = pState->m_mem_size;
+      }
       n = zip_mem_move(pState->m_pMem, pState->m_mem_size, writen_num, read_num,
                        move_count);
     } else {
@@ -1203,7 +1226,11 @@ static int zip_central_dir_move(mz_zip_internal_state *pState, int begin,
     }
   }
 
-  if (next && l_size * r_size != 0) {
+  // deleted run in the middle: survivors on both sides. test each size
+  // against zero directly; l_size * r_size is computed in size_t and wraps to
+  // zero on a 32-bit size_t build when both sides are a multiple of 64 KiB,
+  // which would skip the shift and the offset rebase below.
+  if (next && l_size != 0 && r_size != 0) {
     memmove(deleted, next, r_size);
     {
       int i;
@@ -1258,6 +1285,52 @@ static int zip_central_dir_delete(mz_zip_internal_state *pState,
     pState->m_central_dir_offsets.m_size = (size_t)w;
   }
   return 0;
+}
+
+// Rebase a surviving entry's local-header offset to new_ofs after a delete
+// shifts its data. A non-zip64 entry keeps the offset in the 32-bit
+// central-directory field. A zip64 entry keeps that field at the 0xFFFFFFFF
+// sentinel and stores the real offset in the zip64 extended-information extra
+// field (after the optional 64-bit uncompressed/compressed sizes, which are
+// present only when their own 32-bit fields are the sentinel too); rewrite it
+// there so the entry stays locatable. Returns 0 on success.
+static int zip_cdh_set_local_offset(mz_uint8 *p, mz_uint64 new_ofs) {
+  if (MZ_READ_LE32(p + MZ_ZIP_CDH_LOCAL_HEADER_OFS) != MZ_UINT32_MAX) {
+    MZ_WRITE_LE32(p + MZ_ZIP_CDH_LOCAL_HEADER_OFS, (mz_uint32)new_ofs);
+    return 0;
+  }
+
+  mz_uint16 fname_len = MZ_READ_LE16(p + MZ_ZIP_CDH_FILENAME_LEN_OFS);
+  mz_uint32 extra_rem = MZ_READ_LE16(p + MZ_ZIP_CDH_EXTRA_LEN_OFS);
+  mz_uint8 *extra = p + MZ_ZIP_CENTRAL_DIR_HEADER_SIZE + fname_len;
+  mz_uint32 skip = 0;
+
+  // the zip64 field stores 64-bit uncompressed then compressed size ahead of
+  // the offset, each present only when its own 32-bit field is the sentinel
+  if (MZ_READ_LE32(p + MZ_ZIP_CDH_DECOMPRESSED_SIZE_OFS) == MZ_UINT32_MAX) {
+    skip += 8;
+  }
+  if (MZ_READ_LE32(p + MZ_ZIP_CDH_COMPRESSED_SIZE_OFS) == MZ_UINT32_MAX) {
+    skip += 8;
+  }
+
+  while (extra_rem >= 4) {
+    mz_uint16 field_id = MZ_READ_LE16(extra);
+    mz_uint16 field_size = MZ_READ_LE16(extra + 2);
+    if ((mz_uint32)field_size + 4 > extra_rem) {
+      break;
+    }
+    if (field_id == MZ_ZIP64_EXTENDED_INFORMATION_FIELD_HEADER_ID) {
+      if ((mz_uint32)field_size >= skip + 8) {
+        MZ_WRITE_LE64(extra + 4 + skip, new_ofs);
+        return 0;
+      }
+      break;
+    }
+    extra += 4 + field_size;
+    extra_rem -= 4 + field_size;
+  }
+  return ZIP_ENOHDR;
 }
 
 static ssize_t zip_entries_delete_mark(struct zip_t *zip,
@@ -1340,9 +1413,17 @@ static ssize_t zip_entries_delete_mark(struct zip_t *zip,
         CLEANUP(deleted_entry_flag_array);
         return ZIP_ENOENT;
       }
-      mz_uint32 offset = MZ_READ_LE32(p + MZ_ZIP_CDH_LOCAL_HEADER_OFS);
-      offset -= (mz_uint32)deleted_length;
-      MZ_WRITE_LE32(p + MZ_ZIP_CDH_LOCAL_HEADER_OFS, offset);
+      // a zip64 entry keeps the sentinel in this 32-bit field and the real
+      // offset in an extra field; rebasing the raw field would corrupt the
+      // sentinel and leave the entry unlocatable, so rebase the resolved offset
+      // wherever it actually lives
+      if (zip_cdh_set_local_offset(
+              p, entry_mark[offset_order[i]].m_local_header_ofs -
+                     deleted_length) < 0) {
+        CLEANUP(offset_order);
+        CLEANUP(deleted_entry_flag_array);
+        return ZIP_ENOHDR;
+      }
       i++;
     }
 
@@ -1845,13 +1926,25 @@ static int _zip_entry_open(struct zip_t *zip, const char *entryname,
   if (zip->password) {
     mz_uint8 enc_header[ZIP_PKWARE_ENCRYPT_HEADER_SIZE];
     size_t i;
+    // the header bytes below were derived only from crc32 of the header so far,
+    // a pure function of the password, so every entry encrypted with the same
+    // password got a byte-identical 12-byte header. that leaves the encryption
+    // deterministic (identical plaintext yields identical ciphertext) and lets
+    // entries share a keystream. salt the derivation with this entry's own
+    // local-header offset and time so each entry gets a distinct header; the
+    // salt is stirred per byte with a shift/xor mix to spread its bits.
+    mz_uint32 salt = (mz_uint32)zip->entry.header_offset ^
+                     (mz_uint32)(zip->entry.header_offset >> 16) ^
+                     (mz_uint32)zip->entry.m_time;
 
     zip_pkware_keys_init_password(&zip->entry.enc_keys, zip->password);
 
     for (i = 0; i < ZIP_PKWARE_ENCRYPT_HEADER_SIZE - 1; i++) {
       mz_uint8 rnd =
-          (mz_uint8)(mz_crc32(MZ_CRC32_INIT, enc_header, i) >> (i & 7));
+          (mz_uint8)((mz_crc32(MZ_CRC32_INIT, enc_header, i) ^ salt) >>
+                     (i & 7));
       enc_header[i] = zip_pkware_encrypt_byte(&zip->entry.enc_keys, rnd);
+      salt = (salt << 5) ^ (salt >> 7) ^ (mz_uint32)i;
     }
     enc_header[ZIP_PKWARE_ENCRYPT_HEADER_SIZE - 1] = zip_pkware_encrypt_byte(
         &zip->entry.enc_keys, (mz_uint8)(dos_time >> 8));
@@ -2054,7 +2147,11 @@ int zip_entry_close(struct zip_t *zip) {
 
     if (pState->m_pFile) {
 #ifndef MINIZ_NO_STDIO
-      if (MZ_FSEEK64(pState->m_pFile, (mz_int64)zip->entry.enc_header_ofs,
+      // the writer callbacks add m_file_archive_start_ofs, so a raw seek must
+      // add it too or it lands before the archive on a stub-prefixed file
+      if (MZ_FSEEK64(pState->m_pFile,
+                     (mz_int64)(zip->entry.enc_header_ofs +
+                                pState->m_file_archive_start_ofs),
                      SEEK_SET)) {
         err = ZIP_EFSEEK;
         goto cleanup;
@@ -2106,7 +2203,9 @@ int zip_entry_close(struct zip_t *zip) {
 
         if (pState->m_pFile) {
 #ifndef MINIZ_NO_STDIO
-          if (MZ_FSEEK64(pState->m_pFile, (mz_int64)ofs, SEEK_SET)) {
+          if (MZ_FSEEK64(pState->m_pFile,
+                         (mz_int64)(ofs + pState->m_file_archive_start_ofs),
+                         SEEK_SET)) {
             err = ZIP_EFSEEK;
             goto cleanup;
           }
@@ -2599,6 +2698,14 @@ ssize_t zip_entry_noallocread(struct zip_t *zip, void *buf, size_t bufsize) {
     return (ssize_t)ZIP_ENOENT;
   }
 
+  // a directory entry carries no data: miniz's extractor short-circuits it and
+  // returns success without writing buf or testing bufsize, so returning the
+  // declared uncomp_size below would report more bytes than were written.
+  // reject it as zip_entry_read and zip_entry_fread already do.
+  if (mz_zip_reader_is_file_a_directory(pzip, (mz_uint)zip->entry.index)) {
+    return (ssize_t)ZIP_EINVENTTYPE;
+  }
+
   if (zip->password) {
     void *heap_buf = NULL;
     size_t heap_size = 0;
@@ -2631,6 +2738,20 @@ ssize_t zip_entry_noallocreadwithoffset(struct zip_t *zip, size_t offset,
     return (ssize_t)ZIP_ENOINIT;
   }
 
+  pzip = &(zip->archive);
+  if (pzip->m_zip_mode != MZ_ZIP_MODE_READING ||
+      zip->entry.index < (ssize_t)0) {
+    return (ssize_t)ZIP_ENOENT;
+  }
+
+  // a directory entry carries no data: reject it before the offset check so
+  // every directory call returns ZIP_EINVENTTYPE instead of ZIP_EINVAL for an
+  // offset past the declared uncomp_size. miniz would otherwise return an
+  // unwritten heap block and the copy below would leak uninitialized memory.
+  if (mz_zip_reader_is_file_a_directory(pzip, (mz_uint)zip->entry.index)) {
+    return (ssize_t)ZIP_EINVENTTYPE;
+  }
+
   if (offset >= (size_t)zip->entry.uncomp_size) {
     return (ssize_t)ZIP_EINVAL;
   }
@@ -2640,12 +2761,6 @@ ssize_t zip_entry_noallocreadwithoffset(struct zip_t *zip, size_t offset,
   // clamp and leaving size huge for the memcpy below
   if (size > (size_t)zip->entry.uncomp_size - offset) {
     size = (size_t)(zip->entry.uncomp_size - (mz_uint64)offset);
-  }
-
-  pzip = &(zip->archive);
-  if (pzip->m_zip_mode != MZ_ZIP_MODE_READING ||
-      zip->entry.index < (ssize_t)0) {
-    return (ssize_t)ZIP_ENOENT;
   }
 
   if (zip->password) {
